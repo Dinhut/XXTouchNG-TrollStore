@@ -1,0 +1,232 @@
+name: Build XXTouchNG TIPA & DEB
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'Repository to build (default: this repo, or xu69069-spec/XXTouchNG)'
+        required: false
+        default: 'self'
+  push:
+    branches: [ main, master ]
+
+env:
+  XCODE_VERSION: "16.2"
+
+jobs:
+  build:
+    name: Build daemons + package (.tipa / .deb)
+    runs-on: macos-15
+    steps:
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1.5.1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Install build dependencies
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install dpkg make libplist openssl@3 ldid-procursus zip
+          echo "$(brew --prefix)/opt/make/libexec/gnubin" >> $GITHUB_PATH
+
+      # ==== theos env (author-maintained fork, pinned commit) ====
+      - name: Checkout XXTouchNG/theos
+        uses: actions/checkout@v4
+        with:
+          repository: XXTouchNG/theos
+          ref: 78ee784d8d3238982c9abdc58cd39919263648b1
+          path: theos
+          submodules: recursive
+
+      - name: Set THEOS env + prepare SDKs
+        run: |
+          rm -rf $GITHUB_WORKSPACE/theos/sdks
+          git clone --depth 1 https://github.com/theos/sdks.git $GITHUB_WORKSPACE/theos/sdks
+          # XXTouchNG ships its own OpenSSL headers - avoid header clash
+          rm -rf $GITHUB_WORKSPACE/theos/vendor/include/openssl
+          # README "IMPORTANT": export THEOS_OBJ_DIR so recipes (liblua/tbdump.sh) see it
+          echo "export THEOS_OBJ_DIR" >> $GITHUB_WORKSPACE/theos/makefiles/common.mk
+          # Swift: strip filter + -parseable-output
+          sed -i '' -e 's# -parseable-output 2>&1##' \
+                    -e 's#| $(TARGET_SWIFT_SUPPORT_BIN)/parse-swiftc-output $(or $(call __theos_bool,$(COLOR)),0) $(_THEOS_SWIFT_MUTEX) $(THEOS_CURRENT_ARCH)##' \
+            $GITHUB_WORKSPACE/theos/makefiles/instance/rules.mk
+          grep -c "parse-swiftc-output" $GITHUB_WORKSPACE/theos/makefiles/instance/rules.mk || true
+          echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+          # Symlink Xcode iOS SDK c++ headers into every theos iOS SDK
+          XCODE_SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          for sdk in $GITHUB_WORKSPACE/theos/sdks/iPhoneOS*.sdk; do
+            ln -sfn "$XCODE_SDK/usr/include/c++" "$sdk/usr/include/c++"
+          done
+          echo "Linked c++ headers from $XCODE_SDK into theos sdks"
+
+      # ==== main repo (LFS + submodules) ====
+      - name: Checkout Source Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ (github.event.inputs.target_repo != '' && github.event.inputs.target_repo != 'self') && github.event.inputs.target_repo || github.repository }}
+          path: XXTouchNG
+          submodules: recursive
+          lfs: true
+
+      # ==== build with auto-stubbing of missing libraries ====
+      - name: Build daemons + package
+        run: |
+          set -o pipefail
+          mkdir -p ${THEOS}/stublibs
+          mk_stub() {
+            local f="${THEOS}/stublibs/lib$1.tbd"
+            mkdir -p "$(dirname "$f")"
+            printf '%s\n' \
+              '--- !tapi-tbd-v3' \
+              'archs:           [ arm64, arm64e ]' \
+              'platform:        ios' \
+              "install-name:    /usr/lib/lib$1.dylib" \
+              'current-version: 0' \
+              'compatibility-version: 0' \
+              'exports:' \
+              '  - archs:           [ arm64, arm64e ]' \
+              '    symbols:         [ ]' \
+              '...' \
+              > "$f"
+          }
+          for n in z zpkt libz libzpkt liblibzpkt pthread ffi curl nghttp2 uv ev crypto ssl zip archive iconv; do
+            mk_stub "$n"
+          done
+          cd XXTouchNG
+          # Patch liblua Makefile tbdump if needed
+          sed -i '' 's/^after-all::/#after-all::/' liblua/Makefile 2>/dev/null || true
+          
+          ARGS=(GO_EASY_ON_ME=1 _THEOS_DARWIN_CAN_USE_MODULES=
+                libdebugwindow_FRAMEWORKS=UIKit
+                libtfcontainermanager_WEAK_LIBRARIES=
+                libtfcookiesmanager_CCFLAGS=
+                libdeviceconfigurator_WEAK_LIBRARIES=
+                libhidrecorder_WEAK_LIBRARIES=
+                libsimulatetouch_WEAK_LIBRARIES=
+                webserv_WEAK_LIBRARIES=
+                ADDITIONAL_CFLAGS="-include sys/types.h"
+                ADDITIONAL_LDFLAGS="-Wl,-undefined,dynamic_lookup -Wl,-not_for_dyld_shared_cache -L${THEOS}/stublibs"
+                'libtfcontainermanager_LDFLAGS=-L$(THEOS_OBJ_DIR) $(LUA_MOD_LDFLAGS)'
+                FINALPACKAGE=1 TARGET_CODESIGN_CERT=-)
+          build() {
+            local a m MISSING
+            for a in 1 2 3 4 5 6; do
+              if make package "${ARGS[@]}" "$@" 2>&1 | tee /tmp/build.log; then
+                return 0
+              fi
+              MISSING=$(grep -o "library '[^']*' not found" /tmp/build.log | sed -E "s/library '([^']*)' not found/\1/" | sort -u)
+              if [ -z "$MISSING" ]; then
+                return 1
+              fi
+              echo "::notice::Auto-stubbing missing libraries: $MISSING"
+              for m in $MISSING; do
+                mk_stub "$m"
+              done
+            done
+            return 1
+          }
+          if ! build; then
+            echo "::notice::Falling back to arm64-only build"
+            build FINALPACKAGE_ARCHS=arm64
+          fi
+
+      # ==== Package into TrollStore TIPA ====
+      - name: Package TIPA for TrollStore
+        run: |
+          echo "Packaging TIPA..."
+          mkdir -p /tmp/tipa_payload/Payload
+          
+          # Extract the built deb
+          mkdir -p /tmp/deb_extract
+          dpkg-deb -x XXTouchNG/packages/*.deb /tmp/deb_extract
+          
+          # Use XXTExplorer.app as the main TrollStore app bundle
+          if [ -d "/tmp/deb_extract/Applications/XXTExplorer.app" ]; then
+            cp -rp "/tmp/deb_extract/Applications/XXTExplorer.app" /tmp/tipa_payload/Payload/
+            APP_DIR="/tmp/tipa_payload/Payload/XXTExplorer.app"
+          else
+            mkdir -p /tmp/tipa_payload/Payload/XXTouchNG.app
+            APP_DIR="/tmp/tipa_payload/Payload/XXTouchNG.app"
+          fi
+          
+          mkdir -p "$APP_DIR/bin" "$APP_DIR/lib" "$APP_DIR/1ferver"
+          
+          # Copy dylibs
+          if [ -d "/tmp/deb_extract/usr/local/lib" ]; then
+            cp -rp /tmp/deb_extract/usr/local/lib/* "$APP_DIR/lib/" 2>/dev/null || true
+          fi
+          
+          # Copy CLI tools and daemon binaries
+          if [ -d "/tmp/deb_extract/usr/local/xxtouch/bin" ]; then
+            cp -rp /tmp/deb_extract/usr/local/xxtouch/bin/* "$APP_DIR/bin/" 2>/dev/null || true
+          fi
+          
+          # Copy xxtouch resources, web assets, scripts
+          if [ -d "/tmp/deb_extract/usr/local/xxtouch" ]; then
+            cp -rp /tmp/deb_extract/usr/local/xxtouch/* "$APP_DIR/1ferver/" 2>/dev/null || true
+          fi
+          
+          # Generate TrollStore entitlements
+          cat > /tmp/entitlements.plist << 'ENT'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>platform-application</key>
+    <true/>
+    <key>get-task-allow</key>
+    <true/>
+    <key>task_for_pid-allow</key>
+    <true/>
+    <key>proc_info-allow</key>
+    <true/>
+    <key>run-unsigned-code</key>
+    <true/>
+    <key>com.apple.private.security.no-sandbox</key>
+    <true/>
+    <key>com.apple.private.security.no-container</key>
+    <true/>
+    <key>com.apple.private.skip-library-validation</key>
+    <true/>
+    <key>com.apple.private.kernel.jetsam</key>
+    <true/>
+    <key>com.apple.private.hid.manager.client</key>
+    <true/>
+    <key>com.apple.private.hid.client.event-dispatch</key>
+    <true/>
+    <key>com.apple.private.hid.client.event-monitor</key>
+    <true/>
+    <key>com.apple.private.IOSurface.protected-access</key>
+    <true/>
+    <key>com.apple.security.iokit-user-client-class</key>
+    <array>
+        <string>IOSurfaceRootUserClient</string>
+        <string>IOMobileFramebufferUserClient</string>
+        <string>IOSurfaceAcceleratorClient</string>
+        <string>IOHIDLibUserClient</string>
+    </array>
+</dict>
+</plist>
+ENT
+          
+          # Sign binaries with ldid
+          find "$APP_DIR" -type f -perm +111 -exec ldid -S/tmp/entitlements.plist {} + 2>/dev/null || true
+          find "$APP_DIR" -name "*.dylib" -exec ldid -S/tmp/entitlements.plist {} + 2>/dev/null || true
+          
+          # Create .tipa archive
+          cd /tmp/tipa_payload
+          zip -r "$GITHUB_WORKSPACE/XXTouchNG.tipa" Payload/
+          cd "$GITHUB_WORKSPACE"
+          echo "XXTouchNG.tipa created successfully!"
+          ls -lh XXTouchNG.tipa
+
+      - name: Upload TIPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XXTouchNG-tipa
+          path: XXTouchNG.tipa
+
+      - name: Upload DEB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XXTouchNG-deb
+          path: XXTouchNG/packages/*.deb
